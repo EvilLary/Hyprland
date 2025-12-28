@@ -1,3 +1,4 @@
+#include <chrono>
 #include <csignal>
 #include <cstring>
 #include <print>
@@ -79,11 +80,20 @@ int main(int argc, const char** argv, const char** envp) {
 
     bool safeMode = false;
     while (true) {
+        const auto START = std::chrono::steady_clock::now();
+
         g_instance     = makeUnique<CHyprlandInstance>();
         const bool RET = g_instance->run(safeMode);
         g_instance.reset();
 
+        const auto END = std::chrono::steady_clock::now();
+
         if (!RET) {
+            if (std::chrono::duration_cast<std::chrono::seconds>(START - END).count() < 5) {
+                g_logger->log(Hyprutils::CLI::LOG_ERR, "Hyprland exited not-cleanly within 5 seconds of launching, aborting");
+                return 1;
+            }
+
             g_logger->log(Hyprutils::CLI::LOG_ERR, "Hyprland exit not-cleanly, restarting");
             safeMode = true;
             continue;
