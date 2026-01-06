@@ -1013,8 +1013,8 @@ void CInputManager::setupKeyboard(SP<IKeyboard> keeb) {
         if (PKEEB->m_enabled)
             PROTO::idle->onActivity();
 
-        if (PKEEB->m_enabled && *PDPMS && !g_pCompositor->m_dpmsStateOn)
-            g_pKeybindManager->dpms("on");
+        if (PKEEB->m_enabled && *PDPMS && !g_pCompositor->m_dpmsStateOn && event.state != WL_KEYBOARD_KEY_STATE_RELEASED)
+            CKeybindManager::dpms("on");
     });
 
     keeb->m_keyboardEvents.modifiers.listenStatic([this, keeb = keeb.get()] {
@@ -1026,7 +1026,7 @@ void CInputManager::setupKeyboard(SP<IKeyboard> keeb) {
             PROTO::idle->onActivity();
 
         if (PKEEB->m_enabled && *PDPMS && !g_pCompositor->m_dpmsStateOn)
-            g_pKeybindManager->dpms("on");
+            CKeybindManager::dpms("on");
     });
 
     keeb->m_keyboardEvents.keymap.listenStatic([keeb = keeb.get()] {
