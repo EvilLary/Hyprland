@@ -31,6 +31,8 @@ struct SXDGPositionerState {
 
     void     setAnchor(xdgPositionerAnchor edges);
     void     setGravity(xdgPositionerGravity edges);
+
+    bool     complete();
 };
 
 class CXDGPositionerRules {
@@ -108,6 +110,7 @@ class CXDGToplevelResource {
     uint32_t setActive(bool active);
     uint32_t setSuspeneded(bool sus);
 
+    bool     applySizeLimits();
     void     close();
 
     struct {
@@ -171,6 +174,7 @@ class CXDGSurfaceResource {
 
     static SP<CXDGSurfaceResource> fromResource(wl_resource*);
 
+    bool                           assigned();
     bool                           good();
 
     WP<CXDGWMBase>                 m_owner;
@@ -244,6 +248,7 @@ class CXDGWMBase {
 
     bool                                    good();
     wl_client*                              client();
+    CXdgWmBase*                             resource();
     void                                    ping();
 
     std::vector<WP<CXDGPositionerResource>> m_positioners;

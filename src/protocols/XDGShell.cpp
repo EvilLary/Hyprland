@@ -28,6 +28,10 @@ void SXDGPositionerState::setGravity(xdgPositionerGravity edges) {
     gravity.setRight(edges == XDG_POSITIONER_GRAVITY_RIGHT || edges == XDG_POSITIONER_GRAVITY_TOP_RIGHT || edges == XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
 }
 
+bool SXDGPositionerState::complete() {
+    return requestedSize.size() > 0.0 && anchorRect.size().size() > 0;
+}
+
 CXDGPopupResource::CXDGPopupResource(SP<CXdgPopup> resource_, SP<CXDGSurfaceResource> owner_, SP<CXDGSurfaceResource> surface_, SP<CXDGPositionerResource> positioner) :
     m_surface(surface_), m_parent(owner_), m_resource(resource_), m_positionerRules(positioner) {
     if UNLIKELY (!good())
@@ -56,6 +60,12 @@ CXDGPopupResource::CXDGPopupResource(SP<CXdgPopup> resource_, SP<CXDGSurfaceReso
         auto pos              = CXDGPositionerResource::fromResource(positionerRes);
         if (!pos)
             return;
+
+        if (!pos->m_state.complete()) {
+            m_parent->m_owner->resource()->error(XDG_WM_BASE_ERROR_INVALID_POSITIONER, "positioner is incomplete");
+            return;
+        }
+
         m_positionerRules = CXDGPositionerRules{pos};
         m_events.reposition.emit();
     });
@@ -175,11 +185,21 @@ CXDGToplevelResource::CXDGToplevelResource(SP<CXdgToplevel> resource_, SP<CXDGSu
     });
 
     m_resource->setSetMaxSize([this](CXdgToplevel* r, int32_t x, int32_t y) {
+        if UNLIKELY (x < 0 || y < 0) {
+            m_resource->error(XDG_TOPLEVEL_ERROR_INVALID_SIZE, "width or height in max_size can't be nagative");
+            return;
+        }
+
         m_pending.maxSize = {x, y};
         m_events.sizeLimitsChanged.emit();
     });
 
     m_resource->setSetMinSize([this](CXdgToplevel* r, int32_t x, int32_t y) {
+        if UNLIKELY (x < 0 || y < 0) {
+            m_resource->error(XDG_TOPLEVEL_ERROR_INVALID_SIZE, "width or height in min_size can't be nagative");
+            return;
+        }
+
         m_pending.minSize = {x, y};
         m_events.sizeLimitsChanged.emit();
     });
@@ -352,6 +372,19 @@ uint32_t CXDGToplevelResource::setSuspeneded(bool sus) {
     return m_owner->scheduleConfigure();
 }
 
+bool CXDGToplevelResource::applySizeLimits() {
+    const auto noMax          = m_pending.maxSize.size() == 0;
+    const auto largerThanMax = m_pending.minSize.x > m_pending.maxSize.x || m_pending.minSize.y > m_pending.maxSize.y;
+
+    if UNLIKELY (!noMax && largerThanMax) {
+        m_resource->error(XDG_TOPLEVEL_ERROR_INVALID_SIZE, "min_size can't be larger than max_size");
+        return false;
+    }
+
+    m_current = m_pending;
+    return true;
+}
+
 void CXDGToplevelResource::applyState() {
     wl_array arr;
     wl_array_init(&arr);
@@ -423,13 +456,14 @@ CXDGSurfaceResource::CXDGSurfaceResource(SP<CXdgSurface> resource_, SP<CXDGWMBas
 
     m_listeners.surfaceCommit = m_surface->m_events.commit.listen([this] {
         m_current = m_pending;
-        if (m_toplevel)
-            m_toplevel->m_current = m_toplevel->m_pending;
 
-        if UNLIKELY (m_initialCommit && m_surface->m_pending.buffer) {
-            m_resource->error(-1, "Buffer attached before initial commit");
+        if UNLIKELY (m_initialCommit && m_surface->m_current.buffer) {
+            m_resource->error(XDG_SURFACE_ERROR_UNCONFIGURED_BUFFER, "Buffer attached before initial commit");
             return;
         }
+
+        if (m_toplevel && !m_toplevel->applySizeLimits())
+            return;
 
         if (m_surface->m_current.texture && !m_mapped) {
             // this forces apps to not draw CSD.
@@ -454,6 +488,11 @@ CXDGSurfaceResource::CXDGSurfaceResource(SP<CXdgSurface> resource_, SP<CXDGWMBas
     });
 
     m_resource->setGetToplevel([this](CXdgSurface* r, uint32_t id) {
+        if UNLIKELY (assigned()) {
+            r->error(XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED, "xdg_surface has a role assigned already");
+            return;
+        }
+
         const auto RESOURCE = PROTO::xdgShell->m_toplevels.emplace_back(makeShared<CXDGToplevelResource>(makeShared<CXdgToplevel>(r->client(), r->version(), id), m_self.lock()));
 
         if UNLIKELY (!RESOURCE->good()) {
@@ -480,8 +519,19 @@ CXDGSurfaceResource::CXDGSurfaceResource(SP<CXdgSurface> resource_, SP<CXDGWMBas
     });
 
     m_resource->setGetPopup([this](CXdgSurface* r, uint32_t id, wl_resource* parentXDG, wl_resource* positionerRes) {
-        auto       parent     = parentXDG ? CXDGSurfaceResource::fromResource(parentXDG) : nullptr;
-        auto       positioner = CXDGPositionerResource::fromResource(positionerRes);
+        if UNLIKELY (assigned()) {
+            r->error(XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED, "xdg_surface has a role assigned already");
+            return;
+        }
+
+        auto parent     = parentXDG ? CXDGSurfaceResource::fromResource(parentXDG) : nullptr;
+        auto positioner = CXDGPositionerResource::fromResource(positionerRes);
+
+        if (!positioner->m_state.complete()) {
+            m_owner->resource()->error(XDG_WM_BASE_ERROR_INVALID_POSITIONER, "positioner is incomplete");
+            return;
+        }
+
         const auto RESOURCE =
             PROTO::xdgShell->m_popups.emplace_back(makeShared<CXDGPopupResource>(makeShared<CXdgPopup>(r->client(), r->version(), id), parent, m_self.lock(), positioner));
 
@@ -499,20 +549,43 @@ CXDGSurfaceResource::CXDGSurfaceResource(SP<CXdgSurface> resource_, SP<CXDGWMBas
         if (!parent)
             return;
 
+        if UNLIKELY (!parent->assigned()) {
+            m_resource->error(XDG_WM_BASE_ERROR_INVALID_POPUP_PARENT, "parent surface wasn't assigned a role");
+            PROTO::xdgShell->m_popups.pop_back();
+            return;
+        }
+
         parent->m_popups.emplace_back(RESOURCE);
         if (parent->m_mapped)
             parent->m_events.newPopup.emit(RESOURCE);
     });
 
     m_resource->setAckConfigure([this](CXdgSurface* r, uint32_t serial) {
+        if UNLIKELY (!assigned()) {
+            r->error(XDG_SURFACE_ERROR_NOT_CONSTRUCTED, "xdg_surface wasn't assigned a role");
+            return;
+        }
+
         if (serial < m_lastConfigureSerial)
             return;
+
         m_lastConfigureSerial = serial;
         m_events.ack.emit(serial);
     });
 
     m_resource->setSetWindowGeometry([this](CXdgSurface* r, int32_t x, int32_t y, int32_t w, int32_t h) {
         LOGM(Log::DEBUG, "xdg_surface {:x} requests geometry {}x{} {}x{}", (uintptr_t)this, x, y, w, h);
+
+        if UNLIKELY (!assigned()) {
+            r->error(XDG_SURFACE_ERROR_NOT_CONSTRUCTED, "xdg_surface wasn't assigned a role");
+            return;
+        }
+
+        if UNLIKELY (w <= 0 || h <= 0) {
+            r->error(XDG_SURFACE_ERROR_INVALID_SIZE, "width or height was zero or negative");
+            return;
+        }
+
         m_pending.geometry = {x, y, w, h};
     });
 }
@@ -523,6 +596,10 @@ CXDGSurfaceResource::~CXDGSurfaceResource() {
         wl_event_source_remove(m_configureSource);
     if (m_surface)
         m_surface->resetRole();
+}
+
+bool CXDGSurfaceResource::assigned() {
+    return m_popup || m_toplevel;
 }
 
 bool CXDGSurfaceResource::good() {
@@ -702,16 +779,14 @@ CBox CXDGPositionerRules::getPosition(CBox constraint, const Vector2D& parentCoo
         if (effectiveX + width > constraint.extent().x)
             effectiveX = constraint.extent().x - width;
 
-        if (effectiveX < constraint.x)
-            effectiveX = constraint.x;
+        effectiveX = std::max(effectiveX, constraint.x);
     }
 
     if (m_state.constraintAdjustment & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_SLIDE_Y) {
         if (effectiveY + height > constraint.extent().y)
             effectiveY = constraint.extent().y - height;
 
-        if (effectiveY < constraint.y)
-            effectiveY = constraint.y;
+        effectiveY = std::max(effectiveY, constraint.y);
     }
 
     if (m_state.constraintAdjustment & XDG_POSITIONER_CONSTRAINT_ADJUSTMENT_RESIZE_X) {
@@ -759,12 +834,12 @@ CXDGWMBase::CXDGWMBase(SP<CXdgWmBase> resource_) : m_resource(resource_) {
         auto SURF = CWLSurfaceResource::fromResource(surf);
 
         if UNLIKELY (!SURF) {
-            r->error(-1, "Invalid surface passed");
+            r->error(XDG_WM_BASE_ERROR_INVALID_SURFACE_STATE, "Invalid surface passed");
             return;
         }
 
         if UNLIKELY (SURF->m_role->role() != SURFACE_ROLE_UNASSIGNED) {
-            r->error(-1, "Surface already has a different role");
+            r->error(XDG_SURFACE_ERROR_ALREADY_CONSTRUCTED, "Surface already has a different role");
             return;
         }
 
@@ -798,6 +873,10 @@ bool CXDGWMBase::good() {
 
 wl_client* CXDGWMBase::client() {
     return m_client;
+}
+
+CXdgWmBase* CXDGWMBase::resource() {
+    return m_resource.get();
 }
 
 void CXDGWMBase::ping() {
